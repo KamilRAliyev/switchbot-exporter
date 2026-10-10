@@ -16,14 +16,22 @@ class Sink(Protocol):
     async def stop(self) -> None: ...
 
 
+def _norm(value: str) -> str:
+    """Lowercase and strip ':' and '-' so ids and keys compare equal."""
+    return value.strip().lower().replace(":", "").replace("-", "")
+
+
 def parse_names(raw: Optional[str]) -> Dict[str, str]:
-    """Parse "addr=name,addr=name" into {addr_lower: name}. Skips malformed items."""
+    """Parse "key=name,key=name" into {normalized_key: name}. Skips malformed items.
+
+    A key is a full device id or a suffix of one (4+ chars), normalized with _norm.
+    """
     names: Dict[str, str] = {}
     if not raw:
         return names
     for item in raw.split(","):
         addr, sep, name = item.partition("=")
-        addr = addr.strip().lower()
+        addr = _norm(addr)
         name = name.strip()
         if sep and addr and name:
             names[addr] = name
@@ -31,9 +39,17 @@ def parse_names(raw: Optional[str]) -> Dict[str, str]:
 
 
 def display_name(device_id: str, names: Dict[str, str]) -> str:
-    """Configured name, else meter-<last 4 chars of id>."""
-    found = names.get(device_id.lower())
+    """Configured name, else meter-<last 4 chars of id>.
+
+    Order: exact id match, then the longest key (4+ chars) that is a suffix of
+    the normalized id, then the default.
+    """
+    nid = _norm(device_id)
+    norm = {_norm(k): v for k, v in names.items()}
+    found = norm.get(nid)
     if found:
         return found
-    short = device_id.lower().replace(":", "").replace("-", "")
-    return "meter-" + short[-4:]
+    suffixes = [k for k in norm if len(k) >= 4 and nid.endswith(k)]
+    if suffixes:
+        return norm[max(suffixes, key=len)]
+    return "meter-" + nid[-4:]

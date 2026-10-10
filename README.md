@@ -40,9 +40,17 @@ Every flag has an env var (the flag wins).
 | `--address` (repeatable) | `SWITCHBOT_ADDRESSES` | comma separated; empty means all meters |
 | `--adapter` | `SWITCHBOT_ADAPTER` | Linux only, ignored on macOS |
 | `--interval` | `SWITCHBOT_INTERVAL` | default 60 |
-| (none) | `SWITCHBOT_NAMES` | `addr=bedroom,addr=office` |
+| (none) | `SWITCHBOT_NAMES` | `1065=Office,4a22=Bedroom` |
 
-Without `SWITCHBOT_NAMES`, a device is named `meter-<last 4 chars of id>`. Keep real addresses out of git; pass them via env or an untracked file.
+Without `SWITCHBOT_NAMES`, a device is named `meter-<last 4 chars of id>`. Keep full addresses out of git; pass them via env or an untracked file.
+
+Friendly names:
+
+    SWITCHBOT_NAMES="1065=Office,4a22=Bedroom"
+
+A key is a full device id or a suffix of one (4 or more chars). Case, `:` and `-` are ignored. Lookup order: exact id match, then the longest matching suffix, then `meter-<last 4 chars of id>`. A 4-char suffix is not a full address, so it is fine to commit.
+
+On Linux the id is the real MAC, so the suffix is stable. On macOS ids are per-Mac CoreBluetooth UUIDs, so the suffixes differ there and a Linux-oriented mapping will not match.
 
 ## Metrics
 

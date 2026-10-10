@@ -22,6 +22,8 @@ Response"-style fault state); the next reading clears it.
 
 Pairing: the driver prints the setup code and QR payload itself on start when
 the state file has no paired client. Pairing keys persist in the state file.
+The setup code is not in the state file, so it is kept in `<state_file>.pin`
+(mode 0600) and passed to the driver, which keeps it stable across restarts.
 """
 from __future__ import annotations
 
@@ -30,10 +32,12 @@ import os
 import sys
 import time
 import zlib
+import re
 from typing import Callable, Dict, Optional
 
 from pyhap.accessory import Accessory, Bridge
 from pyhap.accessory_driver import AccessoryDriver
+from pyhap.util import generate_pincode
 
 from ..decode import Reading
 from ..sink import display_name
@@ -42,6 +46,7 @@ LOW_BATTERY_PERCENT = 20
 BRIDGE_NAME = "SwitchBot"
 _NOT_CHARGEABLE = 2  # ChargingState value; Meters use coin cells
 _RESERVED_AIDS = (0, 1, 7)  # 1 is the bridge, 7 is flaky in iOS (see pyhap)
+_PIN_RE = re.compile(r"^\d{3}-\d{2}-\d{3}$")
 
 
 def stable_aid(device_id: str, taken=()) -> int:
@@ -102,10 +107,42 @@ class HomeKitSink:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
-        driver = AccessoryDriver(loop=loop, persist_file=self._state_file, port=self._port)
+        driver = AccessoryDriver(loop=loop, persist_file=self._state_file, port=self._port,
+                                 pincode=self._load_pincode())
         self._attach(driver)
         self._tasks.append(loop.create_task(self._publish_after_warmup()))
         self._tasks.append(loop.create_task(self._stale_loop()))
+
+    def _load_pincode(self) -> bytes:
+        """Return the stable pairing code, creating `<state_file>.pin` if needed.
+
+        The state file does not store the pincode and pyhap picks a random one on
+        every start, so it is kept in its own file next to the state file.
+        """
+        path = self._state_file + ".pin"
+        try:
+            with open(path, "r") as fh:
+                text = fh.read().strip()
+            if _PIN_RE.match(text):
+                return text.encode("ascii")
+        except (OSError, UnicodeDecodeError):
+            pass
+        pincode = bytes(generate_pincode())
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        tmp = "%s.tmp%d" % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(pincode.decode("ascii") + "\n")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return pincode
 
     def _attach(self, driver) -> None:
         """Create the bridge on a driver (split from start() so tests can mock it)."""

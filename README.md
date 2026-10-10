@@ -69,6 +69,8 @@ Gauges, each labelled `device`, `name`, `model`:
 3. In the Home app on an iPhone on the same Wi-Fi: Add Accessory, scan the QR code or enter the PIN.
 4. Pairing keys persist in the state file (gitignored). Keep it to stay paired; delete it to re-pair. The state is per instance, so remove the old pairing in the Home app before pairing a different machine.
 
+The pairing code is stored in `<state file>.pin` (for example `homekit.state.pin`), next to the state file, and stays the same across restarts. Once a phone is paired the code is not needed again.
+
 Each meter shows as temperature, humidity and battery. Without an Apple TV or HomePod acting as a home hub, the Home app shows tiles only while the phone is on the home LAN. Remote viewing needs a hub (or use Grafana via Prometheus).
 
 ## Notes

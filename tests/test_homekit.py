@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -114,6 +115,52 @@ class LifecycleTest(unittest.TestCase):
                 sink._driver.async_stop.assert_awaited_once()
                 self.assertEqual(sink._tasks, [])
         asyncio.run(run())
+
+
+class PincodeTest(unittest.TestCase):
+    PIN_RE = re.compile(r"^\d{3}-\d{2}-\d{3}$")
+
+    def start_pin(self, state):
+        """Start a sink with a mocked driver and return the pincode it was given."""
+        async def run():
+            with mock.patch("switchbot_exporter.sinks.homekit.AccessoryDriver",
+                            return_value=FakeDriver()) as cls:
+                sink = HomeKitSink(state, warmup=60)
+                await sink.start()
+                await sink.stop()
+                return cls.call_args[1]["pincode"]
+        return asyncio.run(run())
+
+    def test_first_start_creates_pin_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s.state")
+            pin = self.start_pin(state)
+            self.assertIsInstance(pin, bytes)
+            self.assertRegex(pin.decode(), self.PIN_RE)
+            with open(state + ".pin") as fh:
+                self.assertEqual(fh.read().strip(), pin.decode())
+
+    def test_second_start_reuses_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s.state")
+            self.assertEqual(self.start_pin(state), self.start_pin(state))
+
+    def test_malformed_file_replaced(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s.state")
+            with open(state + ".pin", "w") as fh:
+                fh.write("not-a-pin\n")
+            pin = self.start_pin(state)
+            self.assertRegex(pin.decode(), self.PIN_RE)
+            with open(state + ".pin") as fh:
+                self.assertEqual(fh.read().strip(), pin.decode())
+
+    def test_pin_file_mode_0600(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "s.state")
+            self.start_pin(state)
+            self.assertEqual(os.stat(state + ".pin").st_mode & 0o777, 0o600)
+            self.assertEqual(os.listdir(d), ["s.state.pin"])  # no temp leftovers
 
 
 if __name__ == "__main__":

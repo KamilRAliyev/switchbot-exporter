@@ -3,9 +3,10 @@ name: Test, Build & Push Container Image
 # Required repository secret, added under this repo's Settings > Secrets and
 # variables > Actions:
 #
-#   HOMESERVER_MONOREPO_TOKEN
-#     Fine-grained GitHub PAT scoped to the homeserver-monorepo repo only.
-#     Permissions: Contents -> Read + Write  (needed to push the bump commit).
+#   HOMESERVER_MONOREPO_DEPLOY_KEY
+#     Private half of an SSH deploy key. The public half is added under the
+#     homeserver-monorepo repo's Settings > Deploy keys with "Allow write
+#     access" enabled (needed to push the bump commit).
 #     The bump job uses this to auto-commit a new image digest so ArgoCD picks
 #     it up on its next poll, with no manual deploy step.
 #
@@ -135,7 +136,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/homeserver-monorepo
-          token: ${{ secrets.HOMESERVER_MONOREPO_TOKEN }}
+          ssh-key: ${{ secrets.HOMESERVER_MONOREPO_DEPLOY_KEY }}
+          persist-credentials: true
           path: homeserver-monorepo
 
       - name: Install yq

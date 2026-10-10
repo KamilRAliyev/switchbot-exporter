@@ -1,0 +1,185 @@
+name: Test, Build & Push Container Image
+
+# Required repository secret, added under this repo's Settings > Secrets and
+# variables > Actions:
+#
+#   HOMESERVER_MONOREPO_TOKEN
+#     Fine-grained GitHub PAT scoped to the homeserver-monorepo repo only.
+#     Permissions: Contents -> Read + Write  (needed to push the bump commit).
+#     The bump job uses this to auto-commit a new image digest so ArgoCD picks
+#     it up on its next poll, with no manual deploy step.
+#
+# Image and monorepo owner come from the github context (repository_owner), so
+# no usernames are hardcoded here.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: test
+  # Run the unit-test suite (stdlib unittest, no BLE hardware) before building.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover tests
+
+  # ---------------------------------------------------------------------------
+  # Job 2: build-and-push
+  # Only runs after `test` passes. Builds the container image, pushes to GHCR,
+  # and surfaces the digest for the bump job.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.name.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GHCR image names must be lowercase; the owner may not be.
+      - name: Compute image name
+        id: name
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          OWNER_LC=$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER_LC}/switchbot-exporter" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=SwitchBot meter BLE exporter (Prometheus and HomeKit)
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Disable provenance + sbom attestations: the extra manifests
+          # trigger cross-blob HEAD requests that GHCR can 403 on.
+          provenance: false
+          sbom: false
+          # Registry-side BuildKit cache on a dedicated tag of the same GHCR
+          # package (type=gha 403'd on the reference repo).
+          cache-from: type=registry,ref=${{ steps.name.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.name.outputs.image }}:buildcache,mode=max,image-manifest=true
+
+      - name: Print image digest
+        run: |
+          echo "Image: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: bump-deployment
+  # Auto-commits a new image digest into homeserver-monorepo so ArgoCD picks
+  # it up. Only runs on the default branch (main).
+  # ---------------------------------------------------------------------------
+  bump-deployment:
+    needs: [test, build-and-push]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: switchbot-exporter-bump
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout homeserver-monorepo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homeserver-monorepo
+          token: ${{ secrets.HOMESERVER_MONOREPO_TOKEN }}
+          path: homeserver-monorepo
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.44.3
+
+      - name: Bump image digest in deployment.yaml
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          SHORT=$(echo "${SHORT_SHA}" | cut -c1-7)
+          # Must `export` so yq's strenv() can see it (it reads from the
+          # process environment, not the running shell's scope).
+          export NEW_IMAGE="${IMAGE}:sha-${SHORT}@${DIGEST}"
+          echo "Setting image to: ${NEW_IMAGE}"
+          yq -i '.spec.template.spec.containers[0].image = strenv(NEW_IMAGE)' \
+            homeserver-monorepo/apps/switchbot-exporter/deployment.yaml
+          # Sanity check: fail loudly if the substitution silently no-op'd.
+          ACTUAL=$(yq '.spec.template.spec.containers[0].image' \
+            homeserver-monorepo/apps/switchbot-exporter/deployment.yaml)
+          if [ "$ACTUAL" != "$NEW_IMAGE" ]; then
+            echo "ERROR: yq substitution failed. Got: '$ACTUAL', expected: '$NEW_IMAGE'"
+            exit 1
+          fi
+
+      - name: Commit and push bump
+        env:
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          SHORT=$(echo "${SHORT_SHA}" | cut -c1-7)
+          cd homeserver-monorepo
+          git config user.name "switchbot-exporter-bot"
+          git config user.email "switchbot-exporter-bot@users.noreply.github.com"
+          git add apps/switchbot-exporter/deployment.yaml
+          git commit -m "chore(switchbot-exporter): bump image to sha-${SHORT} [skip ci]"
+
+          # Push with one rebase-retry on conflict (e.g. concurrent bump from
+          # another workflow run or a human push).
+          if ! git push origin main; then
+            echo "Push failed, attempting rebase and retry..."
+            git pull --rebase origin main
+            git push origin main || {
+              echo "ERROR: Push still failed after rebase. Manual intervention required."
+              exit 1
+            }
+          fi
